@@ -258,7 +258,13 @@ namespace ClearSmallWaterfallsPatcher
                 if (r.WaterType.FormKeyNullable is FormKey wt && !wt.IsNull) waterActi[r.FormKey] = wt;
             }
             var waters = new Dictionary<FormKey, (System.Drawing.Color Sh, System.Drawing.Color Dp)>();
-            foreach (var w in listings.Water().WinningOverrides()) waters[w.FormKey] = (w.ShallowColor, w.DeepColor);
+            var waterInfo = new Dictionary<FormKey, string>();
+            foreach (var w in listings.Water().WinningOverrides())
+            {
+                waters[w.FormKey] = (w.ShallowColor, w.DeepColor);
+                string C(System.Drawing.Color c) => $"{c.R},{c.G},{c.B}";
+                waterInfo[w.FormKey] = $"{w.EditorID ?? w.FormKey.ToString()} shallow {C(w.ShallowColor)} deep {C(w.DeepColor)} reflection {C(w.ReflectionColor)}";
+            }
 
             Log($"base objects: {models.Count}, water activators: {waterActi.Count}, water types: {waters.Count}");
             Kind? KindOf(FormKey b, string m)
@@ -461,16 +467,26 @@ namespace ClearSmallWaterfallsPatcher
             // first), so it does not depend on record-context parents
             var cellWs = new Dictionary<FormKey, FormKey>();
             var cellRegions = new Dictionary<FormKey, List<FormKey>>();
+            var cellWater = new Dictionary<FormKey, FormKey?>();
+            var cellEdid = new Dictionary<FormKey, string>();
             foreach (var lst in listings)
             {
                 try
                 {
+                    foreach (var blk in lst.Mod!.Cells)
+                        foreach (var sb in blk.SubBlocks)
+                            foreach (var c in sb.Cells)
+                            {
+                                if (!cellWater.ContainsKey(c.FormKey)) cellWater[c.FormKey] = c.Water.FormKeyNullable is FormKey iw && !iw.IsNull ? iw : (FormKey?)null;
+                                if (c.EditorID != null) cellEdid.TryAdd(c.FormKey, c.EditorID);
+                            }
                     foreach (var w in lst.Mod!.Worldspaces)
                     {
                         void AddCell(ICellGetter? c)
                         {
                             if (c == null) return;
                             cellWs.TryAdd(c.FormKey, w.FormKey);
+                            if (!cellWater.ContainsKey(c.FormKey)) cellWater[c.FormKey] = c.Water.FormKeyNullable is FormKey cwk && !cwk.IsNull ? cwk : (FormKey?)null;
                             if (!cellRegions.ContainsKey(c.FormKey) && c.Regions != null && c.Regions.Count > 0)
                                 cellRegions[c.FormKey] = c.Regions.Select(x => x.FormKey).ToList();
                         }
@@ -498,6 +514,38 @@ namespace ClearSmallWaterfallsPatcher
                         if (regionEdid.TryGetValue(rk, out var ed) && enbTable.TryGetValue(ed, out var rc)) return rc;
                 return enbTable["Default"];
             }
+            // ---------------- which water each stream falls into (placed water > cell water > worldspace water)
+            FormKey AreaKey(Ref r) => cellWs.TryGetValue(r.Cell, out var wk2) ? wk2 : r.Cell;
+            var waterByArea = refs.Values.Where(r => r.Kind == Kind.Water).GroupBy(AreaKey).ToDictionary(g => g.Key, g => g.ToList());
+            (FormKey? Water, string Source) WaterOf(Ref dr)
+            {
+                if (waterByArea.TryGetValue(AreaKey(dr), out var wl))
+                {
+                    var placed = wl.Where(r => r.Pos[2] < dr.Pos[2] + 20 && H(r.Pos, dr.Pos) < data.WaterSearch).OrderBy(r => H(r.Pos, dr.Pos)).FirstOrDefault();
+                    if (placed?.WaterType != null) return (placed.WaterType, "placed water");
+                }
+                if (cellWater.TryGetValue(dr.Cell, out var cw) && cw != null) return (cw, "cell water");
+                if (cellWs.TryGetValue(dr.Cell, out var wsk) && cache.TryResolve<IWorldspaceGetter>(wsk, out var wsp) && wsp.Water.FormKeyNullable is FormKey ww && !ww.IsNull)
+                    return (ww, "worldspace water");
+                return (null, "none found");
+            }
+            string AreaName(Ref dr)
+            {
+                if (cellWs.TryGetValue(dr.Cell, out var wk3) && cache.TryResolve<IWorldspaceGetter>(wk3, out var wsg)) return wsg.EditorID ?? wk3.ToString();
+                return "Interior " + (cellEdid.TryGetValue(dr.Cell, out var ce) ? ce : dr.Cell.ToString());
+            }
+            // diagnostic: one line per area + water record, so the plugin colours can be compared with what is on screen
+            try
+            {
+                var diag = refs.Values.Where(r => r.Kind == Kind.Drain)
+                    .Select(r => { var (w, src) = WaterOf(r); return (Area: AreaName(r), Src: src, W: w); })
+                    .GroupBy(x => (x.Area, x.Src, x.W)).OrderBy(g => g.Key.Area.StartsWith("Interior") ? 1 : 0).ThenBy(g => g.Key.Area);
+                Log("water check (area | source | water record and its colours | streams):");
+                foreach (var g in diag)
+                    Log($"  WATER {g.Key.Area} | {g.Key.Src} | {(g.Key.W != null && waterInfo.TryGetValue(g.Key.W.Value, out var wi) ? wi : "-")} | {g.Count()}");
+            }
+            catch (Exception e) { Log("note: water check failed: " + e.Message); }
+
             var groupOf = new Dictionary<FormKey, int>();
             foreach (var dr in refs.Values.Where(r => r.Kind == Kind.Drain))
             {
@@ -505,13 +553,7 @@ namespace ClearSmallWaterfallsPatcher
                 if (enb) col = EnbColourFor(dr);                   // ENB: per-area colour table
                 else if (S.TintStreams)
                 {
-                    FormKey? wt = null;
-                    var placed = bySpace[dr.Space]
-                        .Where(r => r.Kind == Kind.Water && r.Pos[2] < dr.Pos[2] + 20 && H(r.Pos, dr.Pos) < data.WaterSearch)
-                        .OrderBy(r => H(r.Pos, dr.Pos)).FirstOrDefault();
-                    if (placed != null) wt = placed.WaterType;
-                    if (wt == null && cache.TryResolve<ICellGetter>(dr.Cell, out var cell) && cell.Water.FormKeyNullable is FormKey cw && !cw.IsNull) wt = cw;
-                    if (wt == null && dr.Exterior && cache.TryResolve<IWorldspaceGetter>(dr.Space, out var wsp) && wsp.Water.FormKeyNullable is FormKey ww && !ww.IsNull) wt = ww;
+                    var (wt, _) = WaterOf(dr);
                     if (wt != null && waters.TryGetValue(wt.Value, out var wc))
                     {
                         var t = Tint(wc.Sh, wc.Dp, enb);
